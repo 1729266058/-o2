@@ -3,28 +3,34 @@ import { simpleParser } from 'mailparser';
 export async function parseMailToHtml(raw) {
   if (!raw) return { html: null, from: 'no-raw' };
   const mail = await simpleParser(raw);
+
   let html = mail.html || null;
   if (!html && mail.text) {
     html = `<pre style="white-space:pre-wrap;">${escapeHtml(mail.text)}</pre>`;
   }
+
+  // 内联小体积 cid 资源（<=1.5MB）
   if (html && mail.attachments && mail.attachments.length) {
     for (const a of mail.attachments) {
-      if (a.cid && a.content && a.content.length <= 1500000) {
+      if (a.cid && a.content && a.content.length <= 1_500_000) {
         const mime = a.contentType || 'application/octet-stream';
-        const b64 = Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(a.content).toString('base64');
+        const b64  = Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(a.content).toString('base64');
         const dataUri = `data:${mime};base64,${b64}`;
         const cidPattern = new RegExp(`cid:${escapeRegExp(a.cid)}`, 'gi');
         html = html.replace(cidPattern, dataUri);
       }
     }
   }
+
   return { html, from: mail.html ? 'mime-html' : (mail.text ? 'mime-text' : 'mime-unknown') };
 }
 
 export function wrapHtmlDocument(innerHtml, { title = 'Message', origin = '' } = {}) {
   return `<!doctype html>
-<html><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>${escapeHtml(title)}</title>
 <style>
   body{margin:0;padding:0;background:#f7f7f7;}
@@ -39,12 +45,11 @@ export function wrapHtmlDocument(innerHtml, { title = 'Message', origin = '' } =
     <div class="meta">Rendered via <b>${escapeHtml(origin)}</b></div>
     <div class="card content">${innerHtml}</div>
   </div>
-</body></html>`;
+</body>
+</html>`;
 }
 
 export function escapeHtml(s='') {
   return s.replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
-function escapeRegExp(s='') {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+function escapeRegExp(s='') { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
