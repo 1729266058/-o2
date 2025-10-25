@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/mail-new.js": {
-      "maxDuration": 60
-    }
-  }
-}
