@@ -1,18 +1,18 @@
 /**
- * 修复版 mail-new.js —— 直接覆盖本文件即可生效
+ * 修复版 mail-new.js —— 覆盖此文件即可
  * 修复点：
- * 1) Graph 分支支持 response_type=html，返回可直出的 HTML 页面（不再空白）
- * 2) Graph 没有 HTML 时，自动用纯文本 <pre> 兜底（可选开启 MIME 兜底）
- * 3) IMAP 分支统一优先 html、否则退文本
+ * 1) Graph 查询增加 $select=body 等字段，确保拿到 body.content（否则一直空）
+ * 2) Graph 分支支持 response_type=html，返回可直接渲染的 HTML（无 html 时退回 <pre> 文本）
+ * 3) IMAP 分支统一优先 html，再退 text，避免空白
  */
 
 const Imap = require('node-imap');
 const { simpleParser } = require('mailparser');
-const fetch = require('node-fetch'); // 确保已安装：npm i node-fetch
+const fetch = require('node-fetch'); // 如用 Node 18 可用全局 fetch；保留这行也兼容
 
-// ====== 小工具 ======
+// ===== 工具 =====
 function escapeHtml(s = '') {
-  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
 function renderHtmlPage({ from, subject, date, htmlBody, textBody }) {
@@ -54,27 +54,25 @@ function renderHtmlPage({ from, subject, date, htmlBody, textBody }) {
 </html>`;
 }
 
-// ====== OAuth 获取 access_token（你原逻辑保留）======
+// ===== OAuth：用 refresh_token 换 access_token（与你原逻辑一致）=====
 async function get_access_token(refresh_token, client_id) {
   const response = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
     body: new URLSearchParams({
-      'client_id': client_id,
-      'grant_type': 'refresh_token',
-      'refresh_token': refresh_token
+      client_id, grant_type: 'refresh_token', refresh_token
     }).toString()
   });
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
   }
-  const responseText = await response.text();
+  const text = await response.text();
   try {
-    const data = JSON.parse(responseText);
+    const data = JSON.parse(text);
     return data.access_token;
-  } catch (parseError) {
-    throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
+  } catch (e) {
+    throw new Error(`Failed to parse JSON: ${e.message}, response: ${text}`);
   }
 }
 
@@ -86,70 +84,52 @@ const generateAuthString = (user, accessToken) => {
 async function graph_api(refresh_token, client_id) {
   const response = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
     body: new URLSearchParams({
-      'client_id': client_id,
-      'grant_type': 'refresh_token',
-      'refresh_token': refresh_token,
-      'scope': 'https://graph.microsoft.com/.default'
+      client_id, grant_type: 'refresh_token', refresh_token,
+      scope: 'https://graph.microsoft.com/.default'
     }).toString()
   });
-
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
   }
-
-  const responseText = await response.text();
-
+  const text = await response.text();
   try {
-    const data = JSON.parse(responseText);
+    const data = JSON.parse(text);
     if (data.scope && data.scope.indexOf('https://graph.microsoft.com/Mail.ReadWrite') !== -1) {
       return { access_token: data.access_token, status: true };
     }
     return { access_token: data.access_token, status: false };
-  } catch (parseError) {
-    throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
+  } catch (e) {
+    throw new Error(`Failed to parse JSON: ${e.message}, response: ${text}`);
   }
 }
 
-// Graph 基础 URL（支持 /me 或 /users/{email}）—— 如果要做 MIME 兜底可用
-function baseUrl(email) {
-  return email ? `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}`
-               : `https://graph.microsoft.com/v1.0/me`;
-}
-
-// ====== 读取最新一封（Graph）======
+// ===== Graph：读取最新一封（关键：加入 $select=body 等）=====
 async function get_emails(access_token, mailbox) {
   if (!access_token) {
     console.log("Failed to obtain access token");
     return [];
   }
-
   try {
-    // 增加 $select 以便拿到 body 的 contentType/content 与 id
-    const url = `https://graph.microsoft.com/v1.0/me/mailFolders/${encodeURIComponent(mailbox)}/messages` +
-      `?$top=1&$orderby=receivedDateTime desc` +
-      `&$select=id,subject,from,body,bodyPreview,createdDateTime,receivedDateTime`;
-
-    const response = await fetch(url, {
+    const url =
+      `https://graph.microsoft.com/v1.0/me/mailFolders/${encodeURIComponent(mailbox)}/messages`
+      + `?$top=1&$orderby=receivedDateTime desc`
+      + `&$select=id,subject,from,body,bodyPreview,createdDateTime,receivedDateTime`;
+    const r = await fetch(url, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Bearer ${access_token}`
-      },
+      headers: { Authorization: `Bearer ${access_token}` }
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('graph list error:', errorText);
+    if (!r.ok) {
+      const t = await r.text();
+      console.error('graph list error:', t);
       return [];
     }
+    const j = await r.json();
+    const emails = Array.isArray(j.value) ? j.value : [];
 
-    const responseData = await response.json();
-    const emails = Array.isArray(responseData.value) ? responseData.value : [];
-
-    const response_emails = emails.map(item => {
+    return emails.map(item => {
       const isHtml = String(item?.body?.contentType || '').toLowerCase() === 'html';
       return {
         id: item.id,
@@ -160,43 +140,20 @@ async function get_emails(access_token, mailbox) {
         date: item.receivedDateTime || item.createdDateTime || '',
       };
     });
-
-    return response_emails;
-  } catch (error) {
-    console.error('Error fetching emails:', error);
+  } catch (err) {
+    console.error('Error fetching emails:', err);
     return [];
   }
 }
 
-/** （可选）MIME 兜底：当 html 为空时，去拉 $value 再解析出真正的 HTML
-async function getHtmlFromMime(access_token, email, messageId) {
-  try {
-    const url = `${baseUrl(email)}/messages/${messageId}/$value`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-    if (!r.ok) {
-      console.error('mime fetch error', await r.text());
-      return null;
-    }
-    const raw = await r.text();
-    const mail = await simpleParser(raw);
-    return mail.html || (mail.text ? `<pre style="white-space:pre-wrap;">${escapeHtml(mail.text)}</pre>` : null);
-  } catch (e) {
-    console.error('mime parse error', e);
-    return null;
-  }
-}
-*/
-
-// ====== 路由处理 ======
+// ===== 路由处理 =====
 module.exports = async (req, res) => {
   try {
-    // 密码校验（可选）
+    // 可选密码校验
     const { password } = req.method === 'GET' ? req.query : req.body;
     const expectedPassword = process.env.PASSWORD;
     if (password !== expectedPassword && expectedPassword) {
-      return res.status(401).json({
-        error: 'Authentication failed. Please provide valid credentials or contact administrator for access.'
-      });
+      return res.status(401).json({ error: 'Authentication failed.' });
     }
 
     // 参数
@@ -210,60 +167,43 @@ module.exports = async (req, res) => {
     console.log("判断是否graph_api");
     const graph_api_result = await graph_api(refresh_token, client_id);
 
-    // ==== Graph 分支 ====
+    // ===== Graph 分支 =====
     if (graph_api_result.status) {
       console.log("是graph_api");
 
-      // 兼容你原有的邮箱名映射
+      // 兼容你的邮箱名映射
       if (mailbox !== "INBOX" && mailbox !== "Junk") mailbox = "inbox";
       if (mailbox === 'INBOX') mailbox = 'inbox';
       if (mailbox === 'Junk')  mailbox = 'junkemail';
 
       const list = await get_emails(graph_api_result.access_token, mailbox);
-      const item = Array.isArray(list) ? list[0] : list; // 只取最新一封
+      const item = Array.isArray(list) ? list[0] : list;
       if (!item) {
         if (String(response_type).toLowerCase() === 'html') {
-          return res.status(200).type('text/html').send(
-            renderHtmlPage({ from: '', subject: '', date: '', htmlBody: '', textBody: '（此目录暂无邮件）' })
-          );
+          return res.status(200).type('text/html')
+                   .send(renderHtmlPage({ from:'', subject:'', date:'', htmlBody:'', textBody:'（此目录暂无邮件）' }));
         }
         return res.status(200).json([]);
       }
 
-      // 若没有 HTML，先用纯文本兜底；（需要更强兜底时，开启上面的 MIME 方法）
-      let htmlBody = item.html || '';
-      let textBody = item.text || '';
-
-      /** // 如果你要 MIME 兜底，把下面三行取消注释：
-      if (!htmlBody && item.id) {
-        const mimeHtml = await getHtmlFromMime(graph_api_result.access_token, email, item.id);
-        if (mimeHtml) { htmlBody = mimeHtml; }
-      }
-      */
+      // 没有 html 就退回纯文本 <pre>
+      const htmlBody = item.html || '';
+      const textBody = item.text || '';
 
       if (String(response_type).toLowerCase() === 'html') {
-        const page = renderHtmlPage({
-          from: item.send,
-          subject: item.subject,
-          date: item.date,
-          htmlBody,
-          textBody
-        });
-        return res.status(200).type('text/html').send(page);
-      } else {
-        // JSON（只返回一封，结构更稳）
-        return res.status(200).json({
-          id: item.id,
-          send: item.send,
-          subject: item.subject,
-          text: textBody,
-          html: htmlBody,
-          date: item.date
-        });
+        return res.status(200).type('text/html')
+                 .send(renderHtmlPage({
+                   from: item.send, subject: item.subject, date: item.date,
+                   htmlBody, textBody
+                 }));
       }
+      return res.status(200).json({
+        id: item.id, send: item.send, subject: item.subject,
+        text: textBody, html: htmlBody, date: item.date
+      });
     }
 
-    // ==== IMAP 分支 ====
+    // ===== IMAP 分支 =====
     const access_token = await get_access_token(refresh_token, client_id);
     const authString = generateAuthString(email, access_token);
 
@@ -278,55 +218,40 @@ module.exports = async (req, res) => {
 
     imap.once("ready", async () => {
       try {
-        // 打开指定邮箱（只读）
         await new Promise((resolve, reject) => {
-          imap.openBox(mailbox, true, (err, box) => {
-            if (err) return reject(err);
-            resolve(box);
-          });
+          imap.openBox(mailbox, true, (err) => err ? reject(err) : resolve());
         });
 
         const results = await new Promise((resolve, reject) => {
           imap.search(["ALL"], (err, results) => {
             if (err) return reject(err);
-            const latestMail = results.slice(-1); // 最新一封
-            resolve(latestMail);
+            resolve(results.slice(-1)); // 最新一封
           });
         });
 
         const f = imap.fetch(results, { bodies: "" });
-
         f.on("message", (msg) => {
           msg.on("body", (stream) => {
             simpleParser(stream, (err, mail) => {
               if (err) throw err;
-
-              const responseData = {
+              const data = {
                 send: mail?.from?.text || '',
                 subject: mail.subject || '',
                 text: mail.text || '',
                 html: mail.html || '',
                 date: mail.date || ''
               };
-
-              if (String(response_type).toLowerCase() === 'json') {
-                res.status(200).json(responseData);
-              } else if (String(response_type).toLowerCase() === 'html') {
-                const page = renderHtmlPage({
-                  from: responseData.send,
-                  subject: responseData.subject,
-                  date: responseData.date,
-                  htmlBody: responseData.html,  // 优先 html
-                  textBody: responseData.text   // 退文本
-                });
-                res.status(200).type('text/html').send(page);
-              } else {
-                res.status(400).json({ error: 'Invalid response_type. Use "json" or "html".' });
+              if (String(response_type).toLowerCase() === 'html') {
+                return res.status(200).type('text/html')
+                         .send(renderHtmlPage({
+                           from: data.send, subject: data.subject, date: data.date,
+                           htmlBody: data.html, textBody: data.text
+                         }));
               }
+              return res.status(200).json(data);
             });
           });
         });
-
         f.once("end", () => imap.end());
       } catch (err) {
         imap.end();
