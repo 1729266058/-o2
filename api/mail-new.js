@@ -1,22 +1,23 @@
 /**
- * mail-new.js —— IMAP OAuth2 强制版（覆盖此文件即可）
- * 适用：只有 Outlook IMAP/SMTP OAuth2 刷新令牌（不是 Graph Mail.Read）
- * 功能：
- *  - 仅用 IMAP + XOAUTH2 读取“最新一封”并渲染
- *  - 自动匹配邮箱夹（INBOX / Junk / Junk Email / 垃圾邮件 等）
- *  - response_type=html：输出完整可渲染页面；json：输出结构化 JSON
- *  - ?debug=1 打印调试日志；?raw=1 返回前 60KB 源码片段（排错）
+ * mail-new.js —— IMAP OAuth2 稳定版（覆盖即可）
+ * 关键修复：
+ *  - search() 返回 UID；fetch() 必须加 { uid: true }，否则会抓错信/抓不到正文 → 页面空白
+ *  - 先把整封原文缓冲完，在 'end' 后交给 mailparser 解析（避免流还没读完就渲染）
+ *  - 优先 html，退 text；若都没有，给出黄条提示而不是白板
+ *  - /api 格式保持不变：response_type=html|json；支持 &debug=1、&raw=1
  */
 
 const Imap = require('node-imap');
 const { simpleParser } = require('mailparser');
-const fetch = require('node-fetch'); // 如 Node18 可用全局 fetch; 保留兼容
+const fetch = require('node-fetch'); // Node18 可省，但保留兼容更稳
 
-// ---------- 工具 ----------
+// ---------- 小工具 ----------
 function escapeHtml(s=''){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function renderHtmlPage({from,subject,date,htmlBody,textBody}){
-  const htmlOrText = htmlBody ? htmlBody : `<pre style="white-space:pre-wrap;">${escapeHtml(textBody||'')}</pre>`;
-  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  const htmlOrText = htmlBody
+    ? htmlBody
+    : `<pre style="white-space:pre-wrap;">${escapeHtml(textBody||'')}</pre>`;
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>邮件信息</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Noto Sans,Arial;background:#f7f7f7;margin:0}
@@ -34,7 +35,7 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Noto Sans,Arial;backgro
     <div><span class="label">日期：</span>${escapeHtml(String(date||''))}</div>
     <div style="margin-top:8px" class="label">内容：</div>
   </div>
-  <div class="content">${htmlOrText || '<div class="warn">此邮件没有可显示的正文或仅包含附件。</div>'}</div>
+  <div class="content">${htmlOrText || '<div class="warn">⚠️ 此邮件没有可显示的正文或仅包含附件/图片。</div>'}</div>
 </div>
 </body></html>`;
 }
@@ -53,35 +54,30 @@ async function get_access_token(refresh_token, client_id){
   if(!j.access_token) throw new Error('no access_token');
   return j.access_token;
 }
-const generateAuthString=(user,accessToken)=>Buffer.from(`user=${user}\x01auth=Bearer ${accessToken}\x01\x01`).toString('base64');
+const genXOAUTH2=(user,token)=>Buffer.from(`user=${user}\x01auth=Bearer ${token}\x01\x01`).toString('base64');
 
-// 智能匹配邮箱夹名（Junk / Junk Email / 垃圾邮件等）
-function findMailboxName(boxes, want){
-  const flat = [];
-  const walk=(obj,pfx='')=>{
+// 智能匹配文件夹名（Junk / Junk Email / 垃圾邮件等）
+function findBoxName(boxes,want){
+  const flat=[];
+  (function walk(obj,pfx=''){
     Object.keys(obj||{}).forEach(name=>{
       const box=obj[name]; const path=pfx?`${pfx}${box.delimiter}${name}`:name;
       flat.push(path);
       if(box.children) walk(box.children,path);
     });
-  };
-  walk(boxes);
-  const wantLC = want.toLowerCase();
-  // 直匹配
-  let hit = flat.find(n=>n.toLowerCase()===wantLC);
+  })(boxes);
+  const wantLC=String(want||'INBOX').toLowerCase();
+  let hit=flat.find(n=>n.toLowerCase()===wantLC);
   if(hit) return hit;
-  // Junk 特殊
   if(wantLC==='junk'){
-    hit = flat.find(n=>/^(junk|junk[-\s]?email|垃圾|垃圾邮件)$/i.test(n));
+    hit=flat.find(n=>/^(junk|junk[-\s]?email|垃圾邮件|垃圾)$/i.test(n));
     if(hit) return hit;
   }
-  // INBOX 兼容
   if(wantLC==='inbox'){
-    hit = flat.find(n=>/^inbox$/i.test(n)) || 'INBOX';
+    hit=flat.find(n=>/^inbox$/i.test(n))||'INBOX';
     return hit;
   }
-  // 退回 INBOX
-  return flat.find(n=>/^inbox$/i.test(n)) || 'INBOX';
+  return flat.find(n=>/^inbox$/i.test(n))||'INBOX';
 }
 
 module.exports = async (req,res)=>{
@@ -97,19 +93,16 @@ module.exports = async (req,res)=>{
     if(!refresh_token || !client_id || !email){
       return res.status(400).json({error:'Missing required parameters: refresh_token, client_id, email'});
     }
-
     const wantDebug = String(debug)==='1';
     const wantRaw   = String(raw)==='1';
 
-    // 1) 换 IMAP 用的 Access Token
+    // 1) 换取 IMAP 的 access_token
     const access_token = await get_access_token(refresh_token, client_id);
-    if(wantDebug) console.log('[imap] got access token');
-
-    const authString = generateAuthString(email, access_token);
+    if(wantDebug) console.log('[imap] token ok');
 
     const imap = new Imap({
       user: email,
-      xoauth2: authString,
+      xoauth2: genXOAUTH2(email, access_token),
       host: 'outlook.office365.com',
       port: 993,
       tls: true,
@@ -118,76 +111,70 @@ module.exports = async (req,res)=>{
 
     imap.once('ready', async ()=>{
       try{
-        // 2) 罗列文件夹并智能定位
-        const boxes = await new Promise((resolve,reject)=>{
-          imap.getBoxes((err, boxes)=> err?reject(err):resolve(boxes));
-        });
-        const boxName = findMailboxName(boxes, mailbox);
+        // 2) 找到正确文件夹名并打开（只读）
+        const boxes = await new Promise((resolve,reject)=>imap.getBoxes((e,b)=>e?reject(e):resolve(b)));
+        const boxName = findBoxName(boxes, mailbox);
         if(wantDebug) console.log('[imap] open box:', boxName);
 
-        // 3) 打开文件夹（只读）
-        await new Promise((resolve,reject)=>{
-          imap.openBox(boxName, true, (err)=> err?reject(err):resolve());
-        });
+        await new Promise((resolve,reject)=>imap.openBox(boxName, true, (e)=>e?reject(e):resolve()));
 
-        // 4) 查找最新一封
-        const ids = await new Promise((resolve,reject)=>{
-          imap.search(['ALL'], (err, results)=>{
-            if(err) return reject(err);
-            const last = results.slice(-1);
-            resolve(last);
+        // 3) 获取最新一封 —— 注意：search 返回 UID！
+        const uids = await new Promise((resolve,reject)=>{
+          imap.search(['ALL'], (e, results)=>{
+            if(e) return reject(e);
+            resolve(results.slice(-1)); // 取最后一个 UID（最新）
           });
         });
-        if(wantDebug) console.log('[imap] latest ids:', ids);
-        if(!ids || !ids.length){
-          const emptyHtml = renderHtmlPage({from:'',subject:'',date:'',htmlBody:'',textBody:'（此目录暂无邮件）'});
+        if(wantDebug) console.log('[imap] latest UID:', uids);
+
+        if(!uids || !uids.length){
+          const html = renderHtmlPage({from:'',subject:'',date:'',htmlBody:'',textBody:'（此目录暂无邮件）'});
           return String(response_type).toLowerCase()==='html'
-            ? res.status(200).type('text/html').send(emptyHtml)
+            ? res.status(200).type('text/html').send(html)
             : res.status(200).json({message:'no messages'});
         }
 
-        if(wantRaw){
-          // 原始源码片段（便于排错）
-          const f = imap.fetch(ids, { bodies: '' });
-          f.on('message', (msg)=>{
-            msg.on('body', async (stream)=>{
-              let rawBuf=''; for await (const chunk of stream) rawBuf+=chunk.toString('utf8');
-              return res.type('text/plain').send(rawBuf.slice(0,60000));
+        // 4) 抓整封原文：一定要加 { uid: true } ！！！
+        const f = imap.fetch(uids, { bodies: '', struct: true, uid: true });
+
+        f.on('message',(msg)=>{
+          let raw='';
+
+          msg.on('body', (stream)=>{
+            stream.on('data', chunk=>{ raw += chunk.toString('utf8'); });
+            stream.once('end', async ()=>{
+              try{
+                if(wantRaw){
+                  // 返回源码片段用于排错
+                  return res.type('text/plain').send(raw.slice(0,60000));
+                }
+
+                const mail = await simpleParser(raw); // 等整封读完再解析
+                const data = {
+                  send:   mail?.from?.text || '',
+                  subject:mail.subject || '',
+                  text:   mail.text || '',
+                  html:   mail.html || '',
+                  date:   mail.date || ''
+                };
+
+                if(String(response_type).toLowerCase()==='html'){
+                  const page = renderHtmlPage({
+                    from: data.send, subject: data.subject, date: data.date,
+                    htmlBody: data.html, textBody: data.text
+                  });
+                  res.status(200).type('text/html').send(page);
+                }else{
+                  res.status(200).json(data);
+                }
+              }catch(e){
+                console.error('[mailparser] error:', e);
+                res.status(500).json({error:String(e.message||e)});
+              }
             });
           });
-          f.once('end', ()=> imap.end());
-          return;
-        }
-
-        // 5) 取整封并用 mailparser 解析
-        const f = imap.fetch(ids, { bodies: '' });
-        f.on('message', (msg)=>{
-          msg.on('body', async (stream)=>{
-            try{
-              const mail = await simpleParser(stream);
-              const data = {
-                send:   mail?.from?.text || '',
-                subject:mail.subject || '',
-                text:   mail.text || '',
-                html:   mail.html || '',
-                date:   mail.date || ''
-              };
-
-              if(String(response_type).toLowerCase()==='html'){
-                const page = renderHtmlPage({
-                  from: data.send, subject: data.subject, date: data.date,
-                  htmlBody: data.html, textBody: data.text
-                });
-                res.status(200).type('text/html').send(page);
-              }else{
-                res.status(200).json(data);
-              }
-            }catch(e){
-              console.error('[mailparser] error:', e);
-              res.status(500).json({error:String(e.message||e)});
-            }
-          });
         });
+
         f.once('end', ()=> imap.end());
 
       }catch(e){
