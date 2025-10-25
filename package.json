@@ -1,14 +1,21 @@
 {
   "dependencies": {
-    "imap": "^0.8.19",
-    "mailin": "^3.0.4",
-    "mailparser": "^3.6.5",
-    "nodemailer": "^6.9.16",
-    "node-imap": "^0.9.6",
+    "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "express": "^4.19.2"
+    "mailparser": "^3.7.1"
   },
-  "scripts": {
-    "start": "node server.js"
+  "overrides": {
+    "mailparser": "^3.7.1",
+    "mailsplit": "^5.4.6",
+    "mimelib": "^0.3.4",
+    "superagent": "^10.2.2",
+    "uuid": "^9.0.1"
+  },
+  "resolutions": {
+    "mailparser": "^3.7.1",
+    "mailsplit": "^5.4.6",
+    "mimelib": "^0.3.4",
+    "superagent": "^10.2.2",
+    "uuid": "^9.0.1"
   }
 }
